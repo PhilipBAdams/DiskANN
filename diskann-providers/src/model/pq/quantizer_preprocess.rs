@@ -271,4 +271,74 @@ mod tests {
             assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
         }
     }
+
+    #[test]
+    fn transposed_matches_fixed_no_opq_zero_centroids_ip() {
+        let (pq_data, mut scratch, query) = setup(128, 4, false, false);
+        let reference = reference_distances(128, 4, false, false, Metric::InnerProduct, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::InnerProduct);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_no_opq_nonzero_centroids_ip() {
+        let (pq_data, mut scratch, query) = setup(128, 4, false, true);
+        let reference = reference_distances(128, 4, false, true, Metric::InnerProduct, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::InnerProduct);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_with_opq_zero_centroids_l2() {
+        let (pq_data, mut scratch, query) = setup(128, 4, true, false);
+        let reference = reference_distances(128, 4, true, false, Metric::L2, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::L2);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_with_opq_zero_centroids_ip() {
+        let (pq_data, mut scratch, query) = setup(128, 4, true, false);
+        let reference = reference_distances(128, 4, true, false, Metric::InnerProduct, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::InnerProduct);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_many_chunks_l2() {
+        let (pq_data, mut scratch, query) = setup(128, 32, false, true);
+        let reference = reference_distances(128, 32, false, true, Metric::L2, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::L2);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_high_dim_opq_nonzero_l2() {
+        let (pq_data, mut scratch, query) = setup(768, 32, true, true);
+        let reference = reference_distances(768, 32, true, true, Metric::L2, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::L2);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn transposed_matches_fixed_high_dim_opq_nonzero_ip() {
+        let (pq_data, mut scratch, query) = setup(768, 32, true, true);
+        let reference = reference_distances(768, 32, true, true, Metric::InnerProduct, &query);
+        let result = new_path_distances(&pq_data, &mut scratch, &query, Metric::InnerProduct);
+        for (r, n) in reference.iter().zip(result.iter()) {
+            assert_relative_eq!(r, n, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
 }
