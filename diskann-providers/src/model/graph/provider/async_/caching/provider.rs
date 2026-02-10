@@ -70,7 +70,7 @@ use diskann::{
         AdjacencyList, SearchOutputBuffer,
         glue::{
             self, AsElement, ExpandBeam, FillSet, InplaceDeleteStrategy, InsertStrategy, Pipeline,
-            PruneStrategy, SearchExt, SearchPostProcessStep, SearchStrategy,
+            PrefetchBeam, PruneStrategy, SearchExt, SearchPostProcessStep, SearchStrategy,
         },
     },
     neighbor::Neighbor,
@@ -868,6 +868,13 @@ impl<A, C, T> ExpandBeam<T> for CachingAccessor<A, C>
 where
     T: ?Sized,
     A: BuildQueryComputer<T> + CacheableAccessor + AsNeighbor,
+    C: ElementCache<A::Id, A::Map> + NeighborCache<A::Id>,
+{
+}
+
+impl<A, C> PrefetchBeam for CachingAccessor<A, C>
+where
+    A: CacheableAccessor + AsNeighbor,
     C: ElementCache<A::Id, A::Map> + NeighborCache<A::Id>,
 {
 }

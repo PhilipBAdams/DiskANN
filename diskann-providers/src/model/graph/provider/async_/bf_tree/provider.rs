@@ -21,7 +21,8 @@ use diskann::{
     graph::{
         AdjacencyList, DiskANNIndex, SearchOutputBuffer,
         glue::{
-            self, ExpandBeam, FillSet, InplaceDeleteStrategy, InsertStrategy, PruneStrategy,
+            self, ExpandBeam, FillSet, InplaceDeleteStrategy, InsertStrategy, PrefetchBeam,
+            PruneStrategy,
             SearchExt, SearchStrategy,
         },
     },
@@ -1053,6 +1054,14 @@ where
 {
 }
 
+impl<T, Q, D> PrefetchBeam for FullAccessor<'_, T, Q, D>
+where
+    T: VectorRepr,
+    Q: AsyncFriendly,
+    D: AsyncFriendly,
+{
+}
+
 impl<T, Q, D> FillSet for FullAccessor<'_, T, Q, D>
 where
     T: VectorRepr,
@@ -1240,6 +1249,13 @@ where
 }
 
 impl<T, D> ExpandBeam<[T]> for QuantAccessor<'_, T, D>
+where
+    T: VectorRepr,
+    D: AsyncFriendly,
+{
+}
+
+impl<T, D> PrefetchBeam for QuantAccessor<'_, T, D>
 where
     T: VectorRepr,
     D: AsyncFriendly,

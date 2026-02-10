@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use diskann::{
     error::{ErrorExt, IntoANNResult},
-    graph::glue::{ExpandBeam, SearchExt},
+    graph::glue::{ExpandBeam, PrefetchBeam, SearchExt},
     provider::{Accessor, AsNeighbor, BuildQueryComputer, DelegateNeighbor, HasId},
     ANNError, ANNErrorKind,
 };
@@ -235,6 +235,12 @@ where
     IA: Accessor,
     EncodedDocumentAccessor<IA>: BuildQueryComputer<Q> + AsNeighbor,
     Q: Clone + AsyncFriendly,
+{
+}
+
+impl<IA> PrefetchBeam for EncodedDocumentAccessor<IA>
+where
+    IA: Accessor,
 {
 }
 

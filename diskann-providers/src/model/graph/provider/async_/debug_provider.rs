@@ -17,7 +17,7 @@ use diskann::{
         AdjacencyList,
         glue::{
             AsElement, ExpandBeam, FillSet, FilterStartPoints, InplaceDeleteStrategy,
-            InsertStrategy, Pipeline, PruneStrategy, SearchExt, SearchStrategy,
+            InsertStrategy, Pipeline, PrefetchBeam, PruneStrategy, SearchExt, SearchStrategy,
         },
     },
     provider::{
@@ -680,6 +680,7 @@ impl BuildQueryComputer<[f32]> for FullAccessor<'_> {
 }
 
 impl ExpandBeam<[f32]> for FullAccessor<'_> {}
+impl PrefetchBeam for FullAccessor<'_> {}
 impl FillSet for FullAccessor<'_> {}
 
 impl postprocess::AsDeletionCheck for FullAccessor<'_> {
@@ -766,6 +767,7 @@ impl BuildQueryComputer<[f32]> for QuantAccessor<'_> {
 }
 
 impl ExpandBeam<[f32]> for QuantAccessor<'_> {}
+impl PrefetchBeam for QuantAccessor<'_> {}
 
 impl postprocess::AsDeletionCheck for QuantAccessor<'_> {
     type Checker = DebugProvider;

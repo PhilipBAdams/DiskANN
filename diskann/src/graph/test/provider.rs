@@ -937,6 +937,7 @@ impl glue::SearchExt for Accessor<'_> {
 }
 
 impl glue::ExpandBeam<[f32]> for Accessor<'_> {}
+impl glue::PrefetchBeam for Accessor<'_> {}
 impl glue::FillSet for Accessor<'_> {}
 
 #[derive(Debug, Default, Clone, Copy)]

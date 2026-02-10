@@ -9,7 +9,8 @@ use crate::storage::{StorageReadProvider, StorageWriteProvider};
 use diskann::{
     ANNError, ANNResult,
     graph::glue::{
-        self, ExpandBeam, FillSet, FilterStartPoints, InsertStrategy, PruneStrategy, SearchExt,
+        self, ExpandBeam, FillSet, FilterStartPoints, InsertStrategy, PrefetchBeam,
+        PruneStrategy, SearchExt,
         SearchStrategy,
     },
     provider::{
@@ -554,6 +555,16 @@ where
 impl<const NBITS: usize, V, D, Ctx, T> ExpandBeam<[T]> for QuantAccessor<'_, NBITS, V, D, Ctx>
 where
     T: VectorRepr,
+    V: AsyncFriendly,
+    D: AsyncFriendly,
+    Ctx: ExecutionContext,
+    Unsigned: Representation<NBITS>,
+    QueryComputer<NBITS>: for<'a> PreprocessedDistanceFunction<CVRef<'a, NBITS>, f32>,
+{
+}
+
+impl<const NBITS: usize, V, D, Ctx> PrefetchBeam for QuantAccessor<'_, NBITS, V, D, Ctx>
+where
     V: AsyncFriendly,
     D: AsyncFriendly,
     Ctx: ExecutionContext,

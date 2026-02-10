@@ -9,7 +9,8 @@ use diskann::{
     ANNError, ANNResult,
     error::{RankedError, ToRanked, TransientError},
     graph::glue::{
-        AsElement, CopyIds, ExpandBeam, FillSet, InsertStrategy, PruneStrategy, SearchExt,
+        AsElement, CopyIds, ExpandBeam, FillSet, InsertStrategy, PrefetchBeam, PruneStrategy,
+        SearchExt,
         SearchStrategy,
     },
     neighbor::Neighbor,
@@ -224,6 +225,7 @@ impl<'a> BuildQueryComputer<[f32]> for FlakyAccessor<'a> {
 }
 
 impl ExpandBeam<[f32]> for FlakyAccessor<'_> {}
+impl PrefetchBeam for FlakyAccessor<'_> {}
 
 impl<'a> DelegateNeighbor<'a> for FlakyAccessor<'_> {
     type Delegate = &'a SimpleNeighborProviderAsync<u32>;

@@ -95,6 +95,10 @@ impl TryAsPooled<&PipelinedScratchArgs<'_>> for PipelinedSearchScratch {
 /// Multiple concurrent `search()` calls on the same `PipelinedSearcher` are safe.
 /// Each search operates on its own `PipelinedReader` and `PQScratch` (pooled for
 /// amortized allocation). Shared state (`PQData`, `GraphHeader`) is immutable.
+#[deprecated(
+    since = "0.46.0",
+    note = "Use DiskIndexSearcher::search_pipelined() with PipelinedDiskAccessor instead"
+)]
 pub struct PipelinedSearcher<Data: GraphDataType<VectorIdType = u32>> {
     #[allow(dead_code)]
     graph_header: GraphHeader,
@@ -123,6 +127,7 @@ pub struct PipelinedSearcher<Data: GraphDataType<VectorIdType = u32>> {
     num_pq_centers: usize,
 }
 
+#[allow(deprecated)]
 impl<Data> PipelinedSearcher<Data>
 where
     Data: GraphDataType<VectorIdType = u32>,
@@ -289,6 +294,7 @@ where
 
 #[cfg(test)]
 #[cfg(target_os = "linux")]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::sync::Arc;

@@ -20,7 +20,7 @@ use diskann::{
     error::StandardError,
     graph::{
         SearchOutputBuffer,
-        glue::{self, ExpandBeam, SearchExt, SearchPostProcessStep, SearchStrategy},
+        glue::{self, ExpandBeam, PrefetchBeam, SearchExt, SearchPostProcessStep, SearchStrategy},
         index::QueryLabelProvider,
     },
     neighbor::Neighbor,
@@ -331,6 +331,12 @@ where
 {
 }
 
+impl<Inner> PrefetchBeam for BetaAccessor<Inner>
+where
+    Inner: AsNeighbor,
+{
+}
+
 /// A [`PreprocessedDistanceFunction`] that applied `beta` filtering to the inner computer.
 pub struct BetaComputer<Inner, I: VectorId> {
     inner: Inner,
@@ -530,6 +536,7 @@ mod tests {
     }
 
     impl ExpandBeam<u64> for Doubler {}
+    impl PrefetchBeam for Doubler {}
 
     #[derive(Debug)]
     struct SimpleStrategy;

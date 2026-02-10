@@ -5,6 +5,11 @@
 
 //! Pipelined search module implementing the PipeANN algorithm.
 //!
+//! **Deprecated**: This standalone pipelined search is being superseded by the unified
+//! approach via `DiskIndexSearcher::search_pipelined()`, which uses `PipelinedDiskAccessor`
+//! through the generic search loop. The standalone `PipelinedSearcher` is retained
+//! temporarily for A/B comparison benchmarking. New code should use the unified path.
+//!
 //! This module provides a pipelined disk search that overlaps IO and compute
 //! within a single query, using io_uring for non-blocking IO on Linux.
 //!
@@ -22,6 +27,8 @@ mod pipelined_reader;
 pub use pipelined_reader::PipelinedReader;
 #[cfg(target_os = "linux")]
 pub use pipelined_reader::PipelinedReaderConfig;
+#[cfg(target_os = "linux")]
+pub use pipelined_reader::MAX_IO_CONCURRENCY;
 
 #[cfg(target_os = "linux")]
 mod pipelined_search;
@@ -29,4 +36,5 @@ mod pipelined_search;
 #[cfg(target_os = "linux")]
 mod pipelined_searcher;
 #[cfg(target_os = "linux")]
+#[allow(deprecated)]
 pub use pipelined_searcher::PipelinedSearcher;

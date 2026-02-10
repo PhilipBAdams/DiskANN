@@ -1122,6 +1122,7 @@ pub(crate) mod disk_index_builder_tests {
     /// Verifies search results via PipelinedSearcher (PipeANN) have good recall
     /// against ground truth computed from the dataset.
     #[cfg(target_os = "linux")]
+    #[allow(deprecated)]
     pub(crate) fn verify_search_result_with_ground_truth_pipelined<
         G: GraphDataType<VectorIdType = u32, AssociatedDataType = ()>,
     >(

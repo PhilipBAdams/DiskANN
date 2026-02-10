@@ -46,6 +46,11 @@ where
     /// This is used to prevent multiple requests to the same `id` from the vector providers.
     pub visited: HashSet<I>,
 
+    /// A record of all IDs that have been submitted for prefetching but not yet expanded.
+    /// Used by the pipelined search loop to track in-flight IO operations and avoid
+    /// re-submitting reads for the same nodes.
+    pub submitted: HashSet<I>,
+
     /// A buffer for adjacency lists.
     ///
     /// Only used by sync.
@@ -123,6 +128,7 @@ where
         Self {
             best,
             visited,
+            submitted: HashSet::new(),
             id_scratch: Vec::new(),
             beam_nodes: Vec::new(),
             in_range: Vec::new(),
@@ -147,6 +153,7 @@ where
     pub fn clear(&mut self) {
         self.best.clear();
         self.visited.clear();
+        self.submitted.clear();
         self.id_scratch.clear();
         self.beam_nodes.clear();
         self.in_range.clear();

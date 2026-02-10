@@ -89,6 +89,16 @@ pub(crate) enum SearchMode {
         #[serde(default)]
         sqpoll_idle_ms: Option<u32>,
     },
+    /// Unified pipelined search using the generic search loop with PipelinedDiskAccessor.
+    /// This routes through DiskIndexSearcher with pipelined configuration enabled.
+    UnifiedPipeSearch {
+        /// Beam width for pipelined IO (default: 4).
+        #[serde(default = "default_initial_beam_width")]
+        initial_beam_width: usize,
+        /// Enable kernel-side SQ polling (ms idle timeout). None = disabled.
+        #[serde(default)]
+        sqpoll_idle_ms: Option<u32>,
+    },
 }
 
 impl fmt::Display for SearchMode {
@@ -104,6 +114,16 @@ impl fmt::Display for SearchMode {
                 if let Some(rm) = relaxed_monotonicity_l {
                     write!(f, ",rm={}", rm)?;
                 }
+                if let Some(sq) = sqpoll_idle_ms {
+                    write!(f, ",sqpoll={}ms", sq)?;
+                }
+                write!(f, ")")
+            }
+            SearchMode::UnifiedPipeSearch {
+                initial_beam_width,
+                sqpoll_idle_ms,
+            } => {
+                write!(f, "UnifiedPipeSearch(bw={}", initial_beam_width)?;
                 if let Some(sq) = sqpoll_idle_ms {
                     write!(f, ",sqpoll={}ms", sq)?;
                 }
@@ -286,6 +306,11 @@ impl CheckDeserialization for DiskSearchPhase {
         match &self.search_mode {
             SearchMode::BeamSearch => {}
             SearchMode::PipeSearch { initial_beam_width, .. } => {
+                if *initial_beam_width == 0 {
+                    anyhow::bail!("initial_beam_width must be positive");
+                }
+            }
+            SearchMode::UnifiedPipeSearch { initial_beam_width, .. } => {
                 if *initial_beam_width == 0 {
                     anyhow::bail!("initial_beam_width must be positive");
                 }

@@ -11,7 +11,7 @@ use diskann::{
         SearchOutputBuffer,
         glue::{
             self, ExpandBeam, FillSet, FilterStartPoints, InplaceDeleteStrategy, InsertStrategy,
-            PruneStrategy, SearchExt, SearchStrategy,
+            PrefetchBeam, PruneStrategy, SearchExt, SearchStrategy,
         },
     },
     neighbor::Neighbor,
@@ -313,6 +313,15 @@ where
 }
 
 impl<T, Q, D, Ctx> ExpandBeam<[T]> for FullAccessor<'_, T, Q, D, Ctx>
+where
+    T: VectorRepr,
+    Q: AsyncFriendly,
+    D: AsyncFriendly,
+    Ctx: ExecutionContext,
+{
+}
+
+impl<T, Q, D, Ctx> PrefetchBeam for FullAccessor<'_, T, Q, D, Ctx>
 where
     T: VectorRepr,
     Q: AsyncFriendly,

@@ -41,6 +41,14 @@ pub struct SearchParams {
     pub k_value: usize,
     pub l_value: usize,
     pub beam_width: Option<usize>,
+    /// Enable adaptive beam width based on waste ratio tracking.
+    /// When true, the search loop adjusts how many nodes to prefetch based on
+    /// what fraction of previously loaded nodes remained useful (in top-L).
+    pub adaptive_beam_width: bool,
+    /// Optional relaxed monotonicity parameter. When set, the search loop
+    /// continues exploring this many additional candidates after convergence
+    /// is first detected, improving recall at the cost of more IO.
+    pub relaxed_monotonicity_l: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -80,7 +88,21 @@ impl SearchParams {
             k_value,
             l_value,
             beam_width,
+            adaptive_beam_width: false,
+            relaxed_monotonicity_l: None,
         })
+    }
+
+    /// Enable adaptive beam width based on waste ratio tracking.
+    pub fn with_adaptive_beam_width(mut self) -> Self {
+        self.adaptive_beam_width = true;
+        self
+    }
+
+    /// Set relaxed monotonicity parameter for extended exploration after convergence.
+    pub fn with_relaxed_monotonicity(mut self, l: usize) -> Self {
+        self.relaxed_monotonicity_l = Some(l);
+        self
     }
 
     pub fn new_default(k_value: usize, l_value: usize) -> Result<Self, SearchParamsError> {

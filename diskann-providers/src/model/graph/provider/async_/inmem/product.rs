@@ -9,7 +9,7 @@ use diskann::{
     ANNError, ANNResult,
     graph::glue::{
         self, ExpandBeam, FillSet, FilterStartPoints, InplaceDeleteStrategy, InsertStrategy,
-        PruneStrategy, SearchExt, SearchStrategy,
+        PrefetchBeam, PruneStrategy, SearchExt, SearchStrategy,
     },
     provider::{
         Accessor, BuildDistanceComputer, BuildQueryComputer, DelegateNeighbor, ExecutionContext,
@@ -241,6 +241,14 @@ where
 impl<T, V, D, Ctx> ExpandBeam<[T]> for QuantAccessor<'_, V, D, Ctx>
 where
     T: VectorRepr,
+    V: AsyncFriendly,
+    D: AsyncFriendly,
+    Ctx: ExecutionContext,
+{
+}
+
+impl<V, D, Ctx> PrefetchBeam for QuantAccessor<'_, V, D, Ctx>
+where
     V: AsyncFriendly,
     D: AsyncFriendly,
     Ctx: ExecutionContext,

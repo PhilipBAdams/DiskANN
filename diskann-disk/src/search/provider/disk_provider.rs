@@ -18,7 +18,10 @@ use std::{
 use diskann::{
     graph::{
         self,
-        glue::{self, ExpandBeam, IdIterator, SearchExt, SearchPostProcess, SearchStrategy},
+        glue::{
+            self, ExpandBeam, IdIterator, PrefetchBeam, SearchExt, SearchPostProcess,
+            SearchStrategy,
+        },
         search_output_buffer, AdjacencyList, DiskANNIndex, SearchOutputBuffer, SearchParams,
     },
     neighbor::Neighbor,
@@ -57,6 +60,23 @@ use crate::{
     utils::QueryStatistics,
 };
 
+/// Configuration for pipelined IO search mode.
+#[cfg(target_os = "linux")]
+pub struct PipelinedConfig {
+    /// Path to the disk index file for direct io_uring reads.
+    pub disk_index_path: String,
+    /// io_uring reader configuration.
+    pub reader_config: crate::search::pipelined::PipelinedReaderConfig,
+    /// Default beam width for pipelined search.
+    pub beam_width: usize,
+    /// Scratch pool for pipelined accessor instances.
+    pub(crate) scratch_pool: Arc<
+        ObjectPool<
+            super::pipelined_accessor::PipelinedAccessorScratch,
+        >,
+    >,
+}
+
 ///////////////////
 // Disk Provider //
 ///////////////////
@@ -71,22 +91,22 @@ where
     Data: GraphDataType<VectorIdType = u32>,
 {
     /// Holds the graph header information that contains metadata about disk-index file.
-    graph_header: GraphHeader,
+    pub(crate) graph_header: GraphHeader,
 
     // Full precision distance comparer used in post_process to reorder results.
-    distance_comparer: <Data::VectorDataType as VectorRepr>::Distance,
+    pub(crate) distance_comparer: <Data::VectorDataType as VectorRepr>::Distance,
 
     /// The PQ data used for quantization.
-    pq_data: Arc<PQData>,
+    pub(crate) pq_data: Arc<PQData>,
 
     /// The number of points in the graph.
-    num_points: usize,
+    pub(crate) num_points: usize,
 
     /// Metric used for distance computation.
-    metric: Metric,
+    pub(crate) metric: Metric,
 
     /// The number of IO operations that can be done in parallel.
-    search_io_limit: usize,
+    pub(crate) search_io_limit: usize,
 }
 
 impl<Data> DataProvider for DiskProvider<Data>
@@ -373,8 +393,8 @@ where
 
 /// The query computer for the disk provider. This is used to compute the distance between the query vector and the PQ coordinates.
 pub struct DiskQueryComputer {
-    num_pq_chunks: usize,
-    query_centroid_l2_distance: Vec<f32>,
+    pub(crate) num_pq_chunks: usize,
+    pub(crate) query_centroid_l2_distance: Vec<f32>,
 }
 
 impl PreprocessedDistanceFunction<&[u8], f32> for DiskQueryComputer {
@@ -471,6 +491,15 @@ where
 
         std::future::ready(result)
     }
+}
+
+impl<Data, VP> PrefetchBeam for DiskAccessor<'_, Data, VP>
+where
+    Data: GraphDataType<VectorIdType = u32>,
+    VP: VertexProvider<Data>,
+{
+    // Default no-op implementations for non-pipelined disk search.
+    // The PipelinedDiskAccessor will override these with io_uring-based IO.
 }
 
 // Scratch space for disk search operations that need allocations.
@@ -791,6 +820,11 @@ pub struct DiskIndexSearcher<
 
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
+
+    /// Optional pipelined IO configuration. When present, enables pipelined search
+    /// via `PipelinedDiskAccessor` using io_uring.
+    #[cfg(target_os = "linux")]
+    pipelined_config: Option<PipelinedConfig>,
 }
 
 #[derive(Debug)]
@@ -891,7 +925,55 @@ where
             runtime,
             vertex_provider_factory,
             scratch_pool,
+            #[cfg(target_os = "linux")]
+            pipelined_config: None,
         })
+    }
+
+    /// Enable pipelined IO search mode using io_uring.
+    ///
+    /// When enabled, the searcher can use `PipelinedDiskAccessor` for search operations
+    /// that overlap IO and compute. Call `search_pipelined()` to use this mode.
+    ///
+    /// # Platform
+    /// Only available on Linux (requires io_uring).
+    #[cfg(target_os = "linux")]
+    pub fn with_pipelined_config(
+        mut self,
+        disk_index_path: String,
+        reader_config: crate::search::pipelined::PipelinedReaderConfig,
+        beam_width: usize,
+    ) -> ANNResult<Self> {
+        use super::pipelined_accessor::PipelinedAccessorScratchArgs;
+
+        let graph_header = self.vertex_provider_factory.get_header()?;
+        let pq_data = &self.index.data_provider.pq_data;
+        let block_size = graph_header.effective_block_size();
+        let num_sectors_per_node = graph_header.num_sectors_per_node();
+        let slot_size = num_sectors_per_node * block_size;
+        let max_slots =
+            (beam_width * 2).clamp(16, crate::search::pipelined::MAX_IO_CONCURRENCY);
+
+        let scratch_args = PipelinedAccessorScratchArgs {
+            disk_index_path: &disk_index_path,
+            max_slots,
+            slot_size,
+            alignment: block_size,
+            graph_degree: graph_header.max_degree::<Data::VectorDataType>()?,
+            dims: graph_header.metadata().dims,
+            num_pq_chunks: pq_data.get_num_chunks(),
+            num_pq_centers: pq_data.get_num_centers(),
+            reader_config: reader_config.clone(),
+        };
+        let scratch_pool = Arc::new(ObjectPool::try_new(&scratch_args, 0, None)?);
+
+        self.pipelined_config = Some(PipelinedConfig {
+            disk_index_path,
+            reader_config,
+            beam_width,
+            scratch_pool,
+        });
+        Ok(self)
     }
 
     /// Helper method to create a DiskSearchStrategy with common parameters
@@ -1018,6 +1100,95 @@ where
             result_count: stats.result_count,
             query_statistics: query_stats.clone(),
         })
+    }
+
+    /// Perform a pipelined search on the disk index using io_uring.
+    ///
+    /// This uses the unified search loop with `PipelinedDiskAccessor` to overlap
+    /// IO and compute. Requires pipelined config to have been set via
+    /// [`with_pipelined_config`](Self::with_pipelined_config).
+    ///
+    /// Returns `Err` if pipelined config is not set.
+    #[cfg(target_os = "linux")]
+    pub fn search_pipelined(
+        &self,
+        query: &[Data::VectorDataType],
+        return_list_size: u32,
+        search_list_size: u32,
+        beam_width: Option<usize>,
+        vector_filter: Option<VectorFilter<Data>>,
+    ) -> ANNResult<SearchResult<Data::AssociatedDataType>> {
+        use super::pipelined_accessor::PipelinedSearchStrategy;
+
+        let config = self.pipelined_config.as_ref().ok_or_else(|| {
+            ANNError::log_index_error(format_args!(
+                "Pipelined search requested but no pipelined config set. \
+                 Call with_pipelined_config() first."
+            ))
+        })?;
+
+        let filter = vector_filter.unwrap_or(default_vector_filter::<Data>());
+        let bw = beam_width.unwrap_or(config.beam_width);
+
+        let strategy = PipelinedSearchStrategy {
+            query,
+            beam_width: bw,
+            scratch_pool: &config.scratch_pool,
+            disk_index_path: &config.disk_index_path,
+            reader_config: &config.reader_config,
+            vector_filter: &*filter,
+        };
+
+        let mut indices = vec![0u32; return_list_size as usize];
+        let mut distances = vec![0f32; return_list_size as usize];
+        let mut associated_data =
+            vec![Data::AssociatedDataType::default(); return_list_size as usize];
+        let mut result_output_buffer = search_output_buffer::IdDistanceAssociatedData::new(
+            &mut indices[..return_list_size as usize],
+            &mut distances[..return_list_size as usize],
+            &mut associated_data[..return_list_size as usize],
+        );
+
+        let mut search_params =
+            SearchParams::new(return_list_size as usize, search_list_size as usize, Some(bw))?;
+        search_params.adaptive_beam_width = true;
+
+        let timer = Instant::now();
+        let stats = self.runtime.block_on(self.index.search(
+            &strategy,
+            &DefaultContext,
+            query,
+            &search_params,
+            &mut result_output_buffer,
+        ))?;
+
+        let mut search_result = SearchResult {
+            results: Vec::with_capacity(return_list_size as usize),
+            stats: SearchResultStats {
+                cmps: stats.cmps,
+                result_count: stats.result_count,
+                query_statistics: QueryStatistics {
+                    total_execution_time_us: timer.elapsed().as_micros(),
+                    total_comparisons: stats.cmps,
+                    search_hops: stats.hops,
+                    ..Default::default()
+                },
+            },
+        };
+
+        for ((vertex_id, distance), associated_data) in indices
+            .into_iter()
+            .zip(distances.into_iter())
+            .zip(associated_data.into_iter())
+        {
+            search_result.results.push(SearchResultItem {
+                vertex_id,
+                distance,
+                data: associated_data,
+            });
+        }
+
+        Ok(search_result)
     }
 }
 
@@ -2134,6 +2305,7 @@ mod disk_provider_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[allow(deprecated)]
     fn test_pipe_search_k10_l100_128dim() {
         use crate::search::pipelined::{PipelinedSearcher, PipelinedReaderConfig};
         use diskann_providers::storage::get_disk_index_file;
@@ -2218,6 +2390,7 @@ mod disk_provider_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[allow(deprecated)]
     fn test_concurrent_beam_and_pipe_search_128dim() {
         use crate::search::pipelined::{PipelinedSearcher, PipelinedReaderConfig};
         use diskann_providers::storage::get_disk_index_file;

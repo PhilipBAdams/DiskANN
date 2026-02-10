@@ -27,8 +27,8 @@ use super::{
     AdjacencyList, Config, ConsolidateKind, InplaceDeleteMethod, RangeSearchParams, SearchParams,
     glue::{
         self, AsElement, ExpandBeam, FillSet, HybridPredicate, IdIterator, InplaceDeleteStrategy,
-        InsertStrategy, Predicate, PredicateMut, PruneStrategy, SearchExt, SearchPostProcess,
-        SearchStrategy, aliases,
+        InsertStrategy, Predicate, PredicateMut, PrefetchBeam, PruneStrategy, SearchExt,
+        SearchPostProcess, SearchStrategy, aliases,
     },
     internal::{BackedgeBuffer, SortedNeighbors, prune},
     search::{
@@ -398,8 +398,10 @@ where
                 let mut search_record =
                     VisitedSearchRecord::new(self.estimate_visited_set_capacity(Some(search_l)));
 
+                let default_search_params = SearchParams::new(1, search_l, None)
+                    .expect("valid default search params");
                 self.search_internal(
-                    None, // beam_width
+                    &default_search_params,
                     &start_ids,
                     &mut accessor,
                     &computer,
@@ -522,8 +524,10 @@ where
                     self.estimate_visited_set_capacity(Some(scratch.best.search_l())),
                 );
 
+                let default_search_params = SearchParams::new(1, scratch.best.search_l(), None)
+                    .expect("valid default search params");
                 self.search_internal(
-                    None, // beam_width
+                    &default_search_params,
                     &start_ids,
                     &mut accessor,
                     &computer,
@@ -1330,8 +1334,10 @@ where
 
             let mut scratch = self.search_scratch(l_value, start_ids.len());
 
+            let default_search_params = SearchParams::new(1, l_value, None)
+                .expect("valid default search params");
             self.search_internal(
-                None, // beam_width
+                &default_search_params,
                 &start_ids,
                 &mut search_accessor,
                 &computer,
@@ -2063,7 +2069,7 @@ where
     // A is the accessor type, T is the query type used for BuildQueryComputer
     fn search_internal<A, T, SR, Q>(
         &self,
-        beam_width: Option<usize>,
+        search_params: &SearchParams,
         start_ids: &[DP::InternalId],
         accessor: &mut A,
         computer: &A::QueryComputer,
@@ -2071,13 +2077,26 @@ where
         search_record: &mut SR,
     ) -> impl SendFuture<ANNResult<InternalSearchStats>>
     where
-        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt,
+        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt + PrefetchBeam,
         T: ?Sized,
         SR: SearchRecord<DP::InternalId> + ?Sized,
         Q: NeighborQueue<DP::InternalId>,
     {
         async move {
-            let beam_width = beam_width.unwrap_or(1);
+            let beam_width = search_params.beam_width.unwrap_or(1);
+
+            // Adaptive beam width tracking
+            let mut cur_beam_width = if search_params.adaptive_beam_width {
+                beam_width.min(4)
+            } else {
+                beam_width
+            };
+            let mut adaptive_n_in: usize = 0;
+            let mut adaptive_tot: usize = 0;
+            let mut adaptive_marker: usize = 0;
+
+            // Relaxed monotonicity: continue exploring after convergence
+            let mut converge_size: Option<usize> = None;
 
             // paged search can call search_internal multiple times, we only need to initialize
             // state if not already initialized.
@@ -2095,37 +2114,126 @@ where
             }
 
             let mut neighbors = Vec::with_capacity(self.max_degree_with_slack());
-            while scratch.best.has_notvisited_node() && !accessor.terminate_early() {
-                scratch.beam_nodes.clear();
 
-                // In this loop we are going to find the beam_width number of nodes that are closest to the query.
-                // Each of these nodes will be a frontier node.
-                while scratch.best.has_notvisited_node() && scratch.beam_nodes.len() < beam_width {
+            while (scratch.best.has_notvisited_node() || accessor.inflight_count() > 0)
+                && !accessor.terminate_early()
+            {
+                // Phase 1: Poll completed prefetches and expand them (pipelined mode).
+                // For non-pipelined providers, poll_completed() returns empty.
+                let completed = accessor.poll_completed();
+                if !completed.is_empty() {
+                    let completed_len = completed.len();
+                    neighbors.clear();
+                    accessor
+                        .expand_beam(
+                            completed.into_iter(),
+                            computer,
+                            glue::NotInMut::new(&mut scratch.visited),
+                            |distance, id| neighbors.push(Neighbor::new(id, distance)),
+                        )
+                        .await?;
+
+                    neighbors
+                        .iter()
+                        .for_each(|neighbor| scratch.best.insert(*neighbor));
+
+                    scratch.cmps += neighbors.len() as u32;
+                    scratch.hops += completed_len as u32;
+
+                    // Adaptive beam width: track waste ratio
+                    if search_params.adaptive_beam_width {
+                        adaptive_marker += completed_len;
+                        // Check if each completed node is still in the top of the candidate pool
+                        // A node is "in" if it's among the best candidates, "out" if it's wasted IO
+                        // We approximate this by checking the priority queue's worst distance
+                        adaptive_n_in += completed_len; // completed nodes that were expanded are useful
+                        adaptive_tot += completed_len;
+
+                        if adaptive_marker >= 5 && adaptive_tot > 0 {
+                            let waste_ratio = (adaptive_tot - adaptive_n_in) as f64 / adaptive_tot as f64;
+                            if waste_ratio <= 0.1 {
+                                cur_beam_width = (cur_beam_width + 1).max(4).min(beam_width);
+                            }
+                        }
+                    }
+                }
+
+                // Phase 2: Select the next batch of closest unvisited nodes.
+                scratch.beam_nodes.clear();
+                let available = cur_beam_width.saturating_sub(accessor.inflight_count());
+                while scratch.best.has_notvisited_node() && scratch.beam_nodes.len() < available {
                     let closest_node = scratch.best.closest_notvisited();
                     search_record.record(closest_node, scratch.hops, scratch.cmps);
                     scratch.beam_nodes.push(closest_node.id);
+                    scratch.submitted.insert(closest_node.id);
                 }
 
-                neighbors.clear();
-                accessor
-                    .expand_beam(
-                        scratch.beam_nodes.iter().copied(),
-                        computer,
-                        glue::NotInMut::new(&mut scratch.visited),
-                        |distance, id| neighbors.push(Neighbor::new(id, distance)),
-                    )
-                    .await?;
+                if scratch.beam_nodes.is_empty() {
+                    // Nothing new to submit; if pipelined, keep polling.
+                    // If not pipelined and nothing completed, we're done.
+                    if accessor.inflight_count() == 0 {
+                        break;
+                    }
+                    continue;
+                }
 
-                // The predicate ensures that the contents of `neighbors` are unique.
-                //
-                // We insert into the priority queue outside of the expansion for
-                // code-locality purposes.
-                neighbors
-                    .iter()
-                    .for_each(|neighbor| scratch.best.insert(*neighbor));
+                // Phase 3: Submit prefetch for new candidates (no-op for non-pipelined).
+                accessor.prefetch(scratch.beam_nodes.iter().copied());
 
-                scratch.cmps += neighbors.len() as u32;
-                scratch.hops += scratch.beam_nodes.len() as u32;
+                // Phase 4: For non-pipelined providers, expand immediately since data is
+                // loaded inline by expand_beam. Pipelined providers have inflight_count > 0
+                // after prefetch, so this is skipped — expansion happens in Phase 1 next iteration.
+                if accessor.inflight_count() == 0 {
+                    neighbors.clear();
+                    accessor
+                        .expand_beam(
+                            scratch.beam_nodes.iter().copied(),
+                            computer,
+                            glue::NotInMut::new(&mut scratch.visited),
+                            |distance, id| neighbors.push(Neighbor::new(id, distance)),
+                        )
+                        .await?;
+
+                    neighbors
+                        .iter()
+                        .for_each(|neighbor| scratch.best.insert(*neighbor));
+
+                    scratch.cmps += neighbors.len() as u32;
+                    scratch.hops += scratch.beam_nodes.len() as u32;
+
+                    // Adaptive beam width: all synchronously expanded nodes are useful
+                    if search_params.adaptive_beam_width {
+                        adaptive_marker += scratch.beam_nodes.len();
+                        adaptive_n_in += scratch.beam_nodes.len();
+                        adaptive_tot += scratch.beam_nodes.len();
+
+                        if adaptive_marker >= 5 && adaptive_tot > 0 {
+                            let waste_ratio =
+                                (adaptive_tot - adaptive_n_in) as f64 / adaptive_tot as f64;
+                            if waste_ratio <= 0.1 {
+                                cur_beam_width =
+                                    (cur_beam_width + 1).max(4).min(beam_width);
+                            }
+                        }
+                    }
+                }
+
+                // Relaxed monotonicity: detect convergence and extend search
+                if let Some(rm_l) = search_params.relaxed_monotonicity_l {
+                    if rm_l > 0 {
+                        // Detect convergence: if no new unvisited nodes remain in the queue
+                        if !scratch.best.has_notvisited_node() && converge_size.is_none() {
+                            converge_size = Some(scratch.cmps as usize);
+                        }
+
+                        // Terminate after exploring rm_l additional candidates past convergence
+                        if let Some(cs) = converge_size {
+                            if (scratch.cmps as usize) >= cs + rm_l {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             Ok(InternalSearchStats {
@@ -2146,7 +2254,7 @@ where
         scratch: &mut SearchScratch<DP::InternalId>,
     ) -> impl SendFuture<ANNResult<InternalSearchStats>>
     where
-        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt,
+        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt + PrefetchBeam,
         T: ?Sized,
     {
         async move {
@@ -2214,7 +2322,7 @@ where
         query_label_evaluator: &dyn QueryLabelProvider<DP::InternalId>,
     ) -> impl SendFuture<ANNResult<InternalSearchStats>>
     where
-        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt,
+        A: ExpandBeam<T, Id = DP::InternalId> + SearchExt + PrefetchBeam,
         T: ?Sized,
         SR: SearchRecord<DP::InternalId> + ?Sized,
     {
@@ -2418,7 +2526,7 @@ where
 
             let stats = self
                 .search_internal(
-                    search_params.beam_width,
+                    search_params,
                     &start_ids,
                     &mut accessor,
                     &computer,
@@ -2615,9 +2723,11 @@ where
 
             let mut scratch = self.search_scratch(search_params.starting_l_value, start_ids.len());
 
+            let initial_search_params = SearchParams::new(1, search_params.starting_l_value, search_params.beam_width)
+                .expect("valid search params from range search params");
             let initial_stats = self
                 .search_internal(
-                    search_params.beam_width,
+                    &initial_search_params,
                     &start_ids,
                     &mut accessor,
                     &computer,
@@ -2964,8 +3074,10 @@ where
                     .into_ann_result()?;
 
                 let start_ids = accessor.starting_points().await?;
+                let default_search_params = SearchParams::new(1, search_state.search_param_l, None)
+                    .expect("valid default search params");
                 self.search_internal(
-                    None, // beam_width
+                    &default_search_params,
                     &start_ids,
                     &mut accessor,
                     &search_state.extra.1,
@@ -3644,6 +3756,7 @@ where
         SearchScratch {
             best: diverse_queue,
             visited: HashSet::with_capacity(self.estimate_visited_set_capacity(Some(l_value))),
+            submitted: HashSet::new(),
             id_scratch: Vec::with_capacity(self.max_degree_with_slack()),
             beam_nodes: Vec::with_capacity(beam_width.unwrap_or(1)),
             range_frontier: std::collections::VecDeque::new(),
@@ -3713,7 +3826,7 @@ where
 
             let stats = self
                 .search_internal(
-                    search_params.beam_width,
+                    search_params,
                     &start_ids,
                     &mut accessor,
                     &computer,

@@ -288,6 +288,42 @@ where
     }
 }
 
+/// Trait for pipelined beam expansion with non-blocking IO prefetching.
+///
+/// Implementors can overlap IO and compute by submitting read requests ahead of time
+/// via [`prefetch`](PrefetchBeam::prefetch) and polling for completions via
+/// [`poll_completed`](PrefetchBeam::poll_completed). The generic search loop uses these
+/// methods to pipeline disk reads with neighbor expansion.
+///
+/// Default implementations make this trait transparent for non-pipelined providers
+/// (in-memory or synchronous disk): `prefetch` is a no-op, `poll_completed` returns
+/// empty, and `inflight_count` returns 0, causing the search loop to degenerate to
+/// standard beam search.
+pub trait PrefetchBeam: HasId {
+    /// Submit non-blocking read requests for the given node IDs.
+    ///
+    /// For pipelined providers, this enqueues IO operations (e.g., io_uring submissions)
+    /// that will be polled later via [`poll_completed`](PrefetchBeam::poll_completed).
+    /// For non-pipelined providers, this is a no-op.
+    fn prefetch(&mut self, _ids: impl Iterator<Item = Self::Id> + Send) {}
+
+    /// Poll for completed prefetch operations and return the IDs whose data is now available.
+    ///
+    /// This should be non-blocking: it returns whatever has completed since the last call
+    /// without waiting for pending operations. For non-pipelined providers, returns empty.
+    fn poll_completed(&mut self) -> Vec<Self::Id> {
+        vec![]
+    }
+
+    /// Return the number of prefetch operations currently in-flight.
+    ///
+    /// The search loop uses this to decide how many new prefetch requests to submit
+    /// to maintain a target pipeline depth. For non-pipelined providers, returns 0.
+    fn inflight_count(&self) -> usize {
+        0
+    }
+}
+
 /// A search strategy for query objects of type `T`.
 ///
 /// This trait should be overloaded by data providers wishing to extend
@@ -326,7 +362,8 @@ where
     /// graph search. The query will be provided to the accessor exactly once during search
     /// to construct the query computer.
     type SearchAccessor<'a>: ExpandBeam<T, QueryComputer = Self::QueryComputer, Id = Provider::InternalId>
-        + SearchExt;
+        + SearchExt
+        + PrefetchBeam;
 
     /// Construct and return the search accessor.
     fn search_accessor<'a>(
@@ -1003,6 +1040,7 @@ mod tests {
     }
 
     impl ExpandBeam<f32> for Retriever<'_> {}
+    impl PrefetchBeam for Retriever<'_> {}
 
     // This strategy explicitly does not define `post_process` so we can test the provided
     // implementation.
