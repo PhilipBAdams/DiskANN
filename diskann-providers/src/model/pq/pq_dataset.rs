@@ -10,19 +10,54 @@ use diskann_quantization::product::TransposedTable;
 
 use crate::model::{FixedChunkPQTable, PQCompressedData};
 
-/// Behind the scenes, we can use either the [`FixedChunkPQTable`] or a
-/// [`diskann_quantization::product::TransposedTable`]. The [`TrasposedTable`] is much faster
-/// for preprocessing, but does not support:
+/// The PQ table used during search preprocessing.
 ///
-/// 1. Removal of the dataset centroid (if that was used).
-/// 2. OPQ style transformations.
-///
-/// So, we can only use the [`TransposedTable`] when OPQ is not used and the dataset centroid
-/// is all zero.
+/// We always use the [`TransposedTable`] for the fast `process_into` distance table
+/// computation, and carry the centroid and optional OPQ rotation matrix alongside it
+/// so that query preprocessing (centroid subtraction + OPQ rotation) can be applied
+/// before the distance table is built.
 #[derive(Debug)]
-pub enum PQTable {
-    Transposed(TransposedTable),
-    Fixed(FixedChunkPQTable),
+pub struct PQTable {
+    table: TransposedTable,
+    /// Per-dimension centroid to subtract from the query. All zeros when the dataset
+    /// was built without centroid removal.
+    centroids: Box<[f32]>,
+    /// Optional OPQ rotation matrix (dim × dim, row-major).
+    opq_rotation_matrix: Option<Box<[f32]>>,
+    /// Dimensionality of the full-precision vectors.
+    dim: usize,
+}
+
+impl PQTable {
+    /// Return a reference to the underlying transposed table.
+    pub fn transposed_table(&self) -> &TransposedTable {
+        &self.table
+    }
+
+    /// Return the per-dimension centroids.
+    pub fn centroids(&self) -> &[f32] {
+        &self.centroids
+    }
+
+    /// Return the optional OPQ rotation matrix.
+    pub fn opq_rotation_matrix(&self) -> Option<&[f32]> {
+        self.opq_rotation_matrix.as_deref()
+    }
+
+    /// Return the dimensionality.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Return the number of PQ chunks.
+    pub fn nchunks(&self) -> usize {
+        self.table.nchunks()
+    }
+
+    /// Return the number of centroids per chunk.
+    pub fn ncenters(&self) -> usize {
+        self.table.ncenters()
+    }
 }
 
 #[derive(Debug)]
@@ -39,17 +74,21 @@ impl PQData {
         pq_pivot_table: FixedChunkPQTable,
         pq_compressed_data: PQCompressedData,
     ) -> ANNResult<Self> {
-        // Check if we can use the transposed table. If so, go for it.
-        let centroid_is_zero = pq_pivot_table.get_centroids().iter().all(|i| *i == 0.0);
-        let pq_pivot_table = if !pq_pivot_table.has_opq() && centroid_is_zero {
-            let transposed = TransposedTable::from_parts(
-                pq_pivot_table.view_pivots(),
-                pq_pivot_table.view_offsets().to_owned(),
-            )
-            .map_err(|err| ANNError::log_pq_error(diskann_quantization::error::format(&err)))?;
-            PQTable::Transposed(transposed)
-        } else {
-            PQTable::Fixed(pq_pivot_table)
+        let dim = pq_pivot_table.get_dim();
+        let centroids = pq_pivot_table.get_centroids().into();
+        let opq_rotation_matrix = pq_pivot_table.get_opq_rotation_matrix();
+
+        let transposed = TransposedTable::from_parts(
+            pq_pivot_table.view_pivots(),
+            pq_pivot_table.view_offsets().to_owned(),
+        )
+        .map_err(|err| ANNError::log_pq_error(diskann_quantization::error::format(&err)))?;
+
+        let pq_pivot_table = PQTable {
+            table: transposed,
+            centroids,
+            opq_rotation_matrix,
+            dim,
         };
 
         Ok(Self {
@@ -65,18 +104,12 @@ impl PQData {
 
     /// Return the number of chunks in the underlying PQ schema.
     pub fn get_num_chunks(&self) -> usize {
-        match &self.pq_pivot_table {
-            PQTable::Transposed(table) => table.nchunks(),
-            PQTable::Fixed(table) => table.get_num_chunks(),
-        }
+        self.pq_pivot_table.nchunks()
     }
 
     /// Return the number of centers in the underlying PQ schema.
     pub fn get_num_centers(&self) -> usize {
-        match &self.pq_pivot_table {
-            PQTable::Transposed(table) => table.ncenters(),
-            PQTable::Fixed(table) => table.get_num_centers(),
-        }
+        self.pq_pivot_table.ncenters()
     }
 
     /// Get pq_compressed_data

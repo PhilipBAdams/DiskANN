@@ -501,6 +501,11 @@ impl FixedChunkPQTable {
         self.opq_rotation_matrix.is_some()
     }
 
+    /// Return the OPQ rotation matrix, if present.
+    pub fn get_opq_rotation_matrix(&self) -> Option<Box<[f32]>> {
+        self.opq_rotation_matrix.clone()
+    }
+
     /// Return the pivots as a `MatrixView`.
     pub fn view_pivots(&self) -> views::MatrixView<'_, f32> {
         self.table.view_pivots()
