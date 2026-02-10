@@ -255,6 +255,392 @@ impl FixedChunkPQTable {
         Ok(())
     }
 
+    /// Dimension-major variant of [`populate_chunk_distances_impl`] that iterates
+    /// chunks → dimensions → centroids, keeping the output accumulator hot in L1
+    /// while streaming through the (potentially large) pivot table.
+    ///
+    /// This mirrors the PipeANN `populate_chunk_distances_l2` loop order which uses
+    /// `_mm512_stream_load_si512` on the centroid table to avoid cache thrashing.
+    ///
+    /// The output layout is identical: `aligned_pq_table_dist_scratch[chunk * num_centers + centroid]`.
+    pub fn populate_chunk_distances_dim_major_l2(
+        &self,
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        let table: &[f32] = self.table.view_pivots().into();
+        let dim = self.get_dim();
+
+        // Zero the output (we accumulate into it).
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let q_val = rotated_query_vec[j];
+                // For each centroid, table[centroid * dim + j] holds the pivot
+                // value for dimension j. We stride by `dim` through the table,
+                // accumulating (q - pivot)^2 into the contiguous chunk_dists
+                // buffer that stays hot in L1.
+                for c in 0..num_centers {
+                    let pivot = table[c * dim + j];
+                    let diff = q_val - pivot;
+                    chunk_dists[c] += diff * diff;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dimension-major inner product variant.
+    pub fn populate_chunk_distances_dim_major_ip(
+        &self,
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        let table: &[f32] = self.table.view_pivots().into();
+        let dim = self.get_dim();
+
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let q_val = rotated_query_vec[j];
+                for c in 0..num_centers {
+                    chunk_dists[c] -= q_val * table[c * dim + j];
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build a transposed pivot table: `tables_t[j * num_centers + c]` holds the
+    /// pivot value for dimension `j`, centroid `c`. This makes the inner 256-centroid
+    /// loop a sequential read, matching the PipeANN `tables_T` layout.
+    pub fn build_transposed_table(&self) -> Vec<f32> {
+        let dim = self.get_dim();
+        let num_centers = self.get_num_centers();
+        let table: &[f32] = self.table.view_pivots().into();
+        let mut tables_t = vec![0.0f32; dim * num_centers];
+        for c in 0..num_centers {
+            for j in 0..dim {
+                tables_t[j * num_centers + c] = table[c * dim + j];
+            }
+        }
+        tables_t
+    }
+
+    /// Dimension-major L2 using a pre-transposed table (built by
+    /// [`build_transposed_table`]). The inner loop reads 256 centroids
+    /// sequentially from `tables_t`, keeping the accumulator in L1.
+    pub fn populate_chunk_distances_transposed_l2(
+        &self,
+        tables_t: &[f32],
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let q_val = rotated_query_vec[j];
+                // Sequential read of 256 centroids for dim j from transposed table.
+                let centers = &tables_t[j * num_centers..(j + 1) * num_centers];
+                for c in 0..num_centers {
+                    let diff = q_val - centers[c];
+                    chunk_dists[c] += diff * diff;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dimension-major L2 using a pre-transposed table with explicit AVX2 SIMD.
+    /// Same algorithm as [`populate_chunk_distances_transposed_l2`] but uses
+    /// `_mm256_loadu_ps` / `_mm256_fmadd_ps` / `_mm256_storeu_ps` instead of
+    /// relying on auto-vectorisation.
+    #[cfg(target_arch = "x86_64")]
+    pub fn populate_chunk_distances_transposed_simd_l2(
+        &self,
+        tables_t: &[f32],
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        use std::arch::x86_64::*;
+
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        // Process 8 centroids per iteration (AVX2 f32x8).
+        // NUM_PQ_CENTROIDS is 256, so 256 / 8 = 32 full iterations with no remainder.
+        const LANES: usize = 8;
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let centers = &tables_t[j * num_centers..];
+                // SAFETY: target-cpu=x86-64-v3 guarantees AVX2 + FMA.
+                // Pointers are within bounds (num_centers == 256, LANES == 8).
+                unsafe {
+                    let q_vec = _mm256_set1_ps(rotated_query_vec[j]);
+                    let mut c = 0;
+                    while c + LANES <= num_centers {
+                        let pivot = _mm256_loadu_ps(centers.as_ptr().add(c));
+                        let diff = _mm256_sub_ps(q_vec, pivot);
+                        let acc = _mm256_loadu_ps(chunk_dists.as_ptr().add(c));
+                        let result = _mm256_fmadd_ps(diff, diff, acc);
+                        _mm256_storeu_ps(chunk_dists.as_mut_ptr().add(c), result);
+                        c += LANES;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build a 64-byte aligned transposed pivot table for use with AVX-512
+    /// non-temporal stream loads. Same layout as [`build_transposed_table`] but
+    /// the backing allocation is 64-byte aligned.
+    pub fn build_transposed_table_aligned(&self) -> crate::common::AlignedBoxWithSlice<f32> {
+        let dim = self.get_dim();
+        let num_centers = self.get_num_centers();
+        let table: &[f32] = self.table.view_pivots().into();
+        let mut tables_t =
+            crate::common::AlignedBoxWithSlice::<f32>::new(dim * num_centers, 64).unwrap();
+        let dst = tables_t.as_mut_slice();
+        for c in 0..num_centers {
+            for j in 0..dim {
+                dst[j * num_centers + c] = table[c * dim + j];
+            }
+        }
+        tables_t
+    }
+
+    /// AVX-512 dimension-major L2 using a pre-transposed, 64-byte aligned table.
+    ///
+    /// Mirrors the PipeANN `populate_chunk_distances_l2` implementation:
+    /// * `_mm512_stream_load_si512` for non-temporal reads of the codebook
+    ///   (avoids cache pollution from the large table)
+    /// * `_mm512_fmadd_ps` for fused multiply-add
+    /// * `_mm512_load_ps` / `_mm512_store_ps` for the accumulator (assumed
+    ///   cache-resident and 64-byte aligned)
+    ///
+    /// Both `tables_t` and `aligned_pq_table_dist_scratch` **must** be 64-byte
+    /// aligned. Use [`build_transposed_table_aligned`] for the table.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx512f")]
+    pub fn populate_chunk_distances_transposed_avx512_l2(
+        &self,
+        tables_t: &[f32],
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        use std::arch::x86_64::*;
+
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        debug_assert_eq!(
+            tables_t.as_ptr() as usize % 64,
+            0,
+            "tables_t must be 64-byte aligned for stream loads"
+        );
+        debug_assert_eq!(
+            aligned_pq_table_dist_scratch.as_ptr() as usize % 64,
+            0,
+            "scratch must be 64-byte aligned"
+        );
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        // Process 16 centroids per iteration (AVX-512 f32x16).
+        // NUM_PQ_CENTROIDS is 256, so 256 / 16 = 16 full iterations with no remainder.
+        const LANES: usize = 16;
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let centers_ptr = tables_t[j * num_centers..].as_ptr();
+                // SAFETY: target-cpu=x86-64-v4 guarantees AVX-512F + FMA.
+                // All pointers are 64-byte aligned and within bounds.
+                unsafe {
+                    let q_vec = _mm512_set1_ps(rotated_query_vec[j]);
+                    let mut c = 0;
+                    while c + LANES <= num_centers {
+                        // Non-temporal stream load: bypasses cache for the
+                        // large codebook table, keeping L1 free for chunk_dists.
+                        let center_i =
+                            _mm512_stream_load_si512(centers_ptr.add(c) as *const _);
+                        let center_f = _mm512_castsi512_ps(center_i);
+                        let diff = _mm512_sub_ps(q_vec, center_f);
+                        let acc = _mm512_load_ps(chunk_dists.as_ptr().add(c));
+                        let result = _mm512_fmadd_ps(diff, diff, acc);
+                        _mm512_store_ps(chunk_dists.as_mut_ptr().add(c), result);
+                        c += LANES;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// AVX-512 dimension-major L2 with regular (non-streaming) loads.
+    /// Same as [`populate_chunk_distances_transposed_avx512_l2`] but uses
+    /// `_mm512_loadu_ps` instead of `_mm512_stream_load_si512`, so no
+    /// alignment requirement on `tables_t`.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx512f")]
+    pub fn populate_chunk_distances_transposed_avx512_regular_l2(
+        &self,
+        tables_t: &[f32],
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        use std::arch::x86_64::*;
+
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        const LANES: usize = 16;
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let centers = &tables_t[j * num_centers..];
+                unsafe {
+                    let q_vec = _mm512_set1_ps(rotated_query_vec[j]);
+                    let mut c = 0;
+                    while c + LANES <= num_centers {
+                        let pivot = _mm512_loadu_ps(centers.as_ptr().add(c));
+                        let diff = _mm512_sub_ps(q_vec, pivot);
+                        let acc = _mm512_loadu_ps(chunk_dists.as_ptr().add(c));
+                        let result = _mm512_fmadd_ps(diff, diff, acc);
+                        _mm512_storeu_ps(chunk_dists.as_mut_ptr().add(c), result);
+                        c += LANES;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dimension-major inner product using a pre-transposed table.
+    pub fn populate_chunk_distances_transposed_ip(
+        &self,
+        tables_t: &[f32],
+        rotated_query_vec: &[f32],
+        aligned_pq_table_dist_scratch: &mut [f32],
+    ) -> ANNResult<()> {
+        let num_centers = self.get_num_centers();
+        let num_chunks = self.get_num_chunks();
+        if aligned_pq_table_dist_scratch.len() < num_chunks * num_centers {
+            return Err(ANNError::log_pq_error(
+                "aligned_pq_table_dist_scratch.len() should at least be num_pq_chunks * num_centers",
+            ));
+        }
+
+        let offsets: &[usize] = self.table.view_offsets().into();
+        aligned_pq_table_dist_scratch[..num_chunks * num_centers].fill(0.0);
+
+        for chunk_index in 0..num_chunks {
+            let chunk_start = offsets[chunk_index];
+            let chunk_end = offsets[chunk_index + 1];
+            let chunk_dists =
+                &mut aligned_pq_table_dist_scratch[chunk_index * num_centers..(chunk_index + 1) * num_centers];
+
+            for j in chunk_start..chunk_end {
+                let q_val = rotated_query_vec[j];
+                let centers = &tables_t[j * num_centers..(j + 1) * num_centers];
+                for c in 0..num_centers {
+                    chunk_dists[c] -= q_val * centers[c];
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Pre-calculated the distance between each chunk in the query vector and each centroid
     /// by l2 distance.
     /// * `rotated_query_vec` - query vector: 1 * dim
@@ -1425,6 +1811,271 @@ mod fixed_chunk_pq_table_test {
         let result = pq_table
             .populate_chunk_distances(&rotated_query_vec, &mut aligned_pq_table_dist_scratch);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dim_major_matches_centroid_major_l2() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut dim_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_distances(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_dim_major_l2(&rotated_query, &mut dim_major)
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], dim_major[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_dim_major_matches_centroid_major_ip() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut dim_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_inner_products(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_dim_major_ip(&rotated_query, &mut dim_major)
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], dim_major[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_transposed_matches_centroid_major_l2() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let tables_t = table.build_transposed_table();
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut transposed = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_distances(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_transposed_l2(&tables_t, &rotated_query, &mut transposed)
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], transposed[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_transposed_matches_centroid_major_ip() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let tables_t = table.build_transposed_table();
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut transposed = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_inner_products(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_transposed_ip(&tables_t, &rotated_query, &mut transposed)
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], transposed[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_transposed_simd_matches_centroid_major_l2() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let tables_t = table.build_transposed_table();
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut simd = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_distances(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_transposed_simd_l2(&tables_t, &rotated_query, &mut simd)
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], simd[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx512f")]
+    fn test_transposed_avx512_matches_centroid_major_l2() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let tables_t = table.build_transposed_table_aligned();
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut scratch =
+            crate::common::AlignedBoxWithSlice::<f32>::new(num_pq_chunks * NUM_PQ_CENTROIDS, 64)
+                .unwrap();
+
+        table
+            .populate_chunk_distances(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_transposed_avx512_l2(
+                tables_t.as_slice(),
+                &rotated_query,
+                scratch.as_mut_slice(),
+            )
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], scratch[i], epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx512f")]
+    fn test_transposed_avx512_regular_matches_centroid_major_l2() {
+        use rand::Rng;
+
+        let dim = 128;
+        let num_pq_chunks = 4;
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let pq_table: Vec<f32> = (0..NUM_PQ_CENTROIDS * dim).map(|_| rng.random()).collect();
+        let centroids: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let chunk_offsets: Vec<usize> = vec![0, 32, 64, 96, 128];
+        let table = FixedChunkPQTable::new(
+            dim,
+            pq_table.into(),
+            centroids.into(),
+            chunk_offsets.into(),
+            None,
+        )
+        .unwrap();
+
+        let tables_t = table.build_transposed_table();
+        let rotated_query: Vec<f32> = (0..dim).map(|_| rng.random()).collect();
+        let mut centroid_major = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+        let mut avx512 = vec![0.0f32; num_pq_chunks * NUM_PQ_CENTROIDS];
+
+        table
+            .populate_chunk_distances(&rotated_query, &mut centroid_major)
+            .unwrap();
+        table
+            .populate_chunk_distances_transposed_avx512_regular_l2(
+                &tables_t,
+                &rotated_query,
+                &mut avx512,
+            )
+            .unwrap();
+
+        for i in 0..centroid_major.len() {
+            assert_relative_eq!(centroid_major[i], avx512[i], epsilon = 1e-5);
+        }
     }
 }
 #[cfg(test)]

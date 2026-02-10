@@ -12,6 +12,7 @@ use benchmarks::{
     neighbor_bench::{
         benchmark_priority_queue_has_notvisited_node, benchmark_priority_queue_insert,
     },
+    populate_chunk_bench::benchmark_populate_chunk_distances,
 };
 use criterion::{criterion_group, criterion_main};
 mod benchmarks;
@@ -24,7 +25,8 @@ criterion_group!(
     benchmark_diskann_insert,
     benchmark_priority_queue_has_notvisited_node,
     benchmark_copy_aligned_data,
-    benchmark_chunking_size_closest_centers_performance
+    benchmark_chunking_size_closest_centers_performance,
+    benchmark_populate_chunk_distances,
 );
 
 criterion_main!(benches);
